@@ -1,0 +1,16 @@
+# Secrets / credentials -- never commit these
+.env
+*.pem
+*.key
+
+# Data & logs
+snapshots.csv
+*.log
+risk_monitor_log.txt
+service.log
+service_error.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc
