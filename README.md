@@ -9,7 +9,10 @@ of regime shift that precedes a cascade.
 > grid/market-making strategy needs to know that the venue it is exposed to is
 > dislocating from the rest of the market **before** the move completes, not after.
 
-It runs 24/7 as a deployed service on AWS EC2 and pushes alerts to Telegram.
+It runs 24/7 as a deployed service on AWS EC2. It is **quiet by design** — Telegram
+only receives a message when a real dislocation is confirmed (no periodic "still
+alive" noise). Liveness and live metrics are exposed instead through a lightweight
+**HTTP status panel**.
 
 ---
 
@@ -50,6 +53,27 @@ which doubles as the training/evaluation dataset for the anomaly-detection work 
 
 ---
 
+## Status panel
+
+A small read-only web panel runs in the same process (no extra service) and is the
+way to answer *"is it alive, and what is it seeing right now?"* — replacing the old
+periodic Telegram heartbeat.
+
+- `GET /` — auto-refreshing HTML panel: alive/stale badge, current fee-adjusted
+  spread, Binance-USD vs benchmark, last check age, uptime, and the last alert.
+- `GET /healthz` — JSON for uptime monitors. Returns **200** when a fresh snapshot
+  arrived within ~3 poll intervals, **503** when the fetch loop has gone stale.
+
+Binds `0.0.0.0:PANEL_PORT` (default `8080`). On EC2, open that port in the instance's
+security group to reach it at `http://<ec2-public-ip>:8080/`. The panel is public and
+read-only — it exposes market metrics only (no keys, no positions).
+
+## Telegram: bot vs channel
+
+The bot is the *sender*; the recipient is whatever `TG_CHAT_ID` points at. To broadcast
+alerts to a **channel**: create the channel, add the bot as an **admin**, and set
+`TG_CHAT_ID` to the channel's `@username` (public) or `-100…` id (private). No code change.
+
 ## Tech stack
 
 - **Python** (async) · **ccxt** for unified exchange APIs · **Telegram Bot API** for alerts
@@ -65,6 +89,7 @@ python risk_monitor.py
 ```
 
 Telegram is optional — with no token set, alerts are logged to console/file instead.
+Once running, open the status panel at <http://localhost:8080/>.
 
 ## Deploy (AWS EC2, systemd)
 
