@@ -10,6 +10,9 @@ risk_monitor_log.txt
 service.log
 service_error.log
 
+# Personal ops notes (private -- contains deployment footprint)
+note.md
+
 # Python
 .venv/
 __pycache__/

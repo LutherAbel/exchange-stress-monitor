@@ -39,17 +39,39 @@ which doubles as the training/evaluation dataset for the anomaly-detection work 
 ## How it works
 
 ```
-            ┌── Binance  BTC/USDT ─┐
- concurrent ├── Coinbase BTC/USD  ─┤   depth-aware      basis-adjusted     time-normalized
- fetch ─────┤── Kraken   BTC/USD  ─┼─► impact price ─► USD spread (median ─► sustained +    ─► Telegram alert
-            └── Kraken   USDT/USD ─┘   per venue        benchmark, fee-adj)   accelerating?     + CSV log
+            ┌── Binance  BTC/USDT ─┐                                                       ┌─► snapshots.csv   (every snapshot)
+ concurrent ├── Coinbase BTC/USD  ─┤   depth-aware      basis-adjusted     time-normalized │
+ fetch ─────┤── Kraken   BTC/USD  ─┼─► impact price ─► USD spread (median ─► sustained &  ─┼─► status panel    (live, always)
+ (20s)      └── Kraken   USDT/USD ─┘   per venue        benchmark, fee-adj)  accelerating? └─► Telegram channel (anomaly ONLY)
 ```
 
 1. **Ingest** four books/tickers concurrently; reject if the fetch window is too wide.
 2. **Price** the real exit cost on each venue for the configured USD size.
 3. **Normalize** Binance into USD via the USDT/USD basis; build a median USD benchmark.
 4. **Score** the fee-adjusted discount and its %/minute velocity over a rolling window.
-5. **Confirm & alert** only on a sustained, accelerating dislocation (with cooldown).
+5. **Emit:** every snapshot is logged to CSV and published to the status panel; Telegram
+   fires **only** on a confirmed sustained dislocation (with cooldown) — never on a timer.
+
+---
+
+## Runtime architecture
+
+A single Python process runs **two concurrent jobs in one asyncio event loop**:
+
+- the **monitor loop** — fetch → score → maybe-alert, every `POLL_INTERVAL_S`
+- the **status-panel server** (aiohttp) — serves `GET /` and `GET /healthz`
+
+The loop keeps the latest snapshot in memory; the panel reads that shared state, so it
+adds no extra exchange calls. Deployed topology:
+
+```
+ AWS EC2  (Ubuntu 24.04, ap-southeast-2 / Sydney)
+   └─ systemd service ............... auto-restart on crash, starts on boot
+        └─ .venv/bin/python risk_monitor.py   (config from .env)
+             ├─ outbound → Binance / Coinbase / Kraken  (REST, every 20s)
+             ├─ outbound → Telegram Bot API → channel    (anomaly only)
+             └─ inbound  ← :8080  via Elastic IP + security group → public status panel
+```
 
 ---
 
@@ -93,8 +115,10 @@ Once running, open the status panel at <http://localhost:8080/>.
 
 ## Deploy (AWS EC2, systemd)
 
-A `systemd` unit keeps it running across disconnects and reboots with auto-restart;
-logs are captured to disk. (Unit file in deployment notes.)
+Clone the repo, create the `.venv`, fill in `.env`, then run it under a `systemd` unit so
+it survives disconnects/reboots and auto-restarts on crash. Expose the panel by opening
+`PANEL_PORT` in the instance security group; use an **Elastic IP** for a stable public URL.
+Step-by-step commands (SSH, AWS setup, systemd, update/redeploy) live in `note.md`.
 
 ---
 
