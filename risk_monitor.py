@@ -75,7 +75,8 @@ def impact_sell_price(bids, usd_size: float) -> float | None:
     remaining = usd_size
     total_base = 0.0
     total_quote = 0.0
-    for price, amount in bids:
+    for level in bids:
+        price, amount = level[0], level[1]  # some venues append a timestamp
         level_value = price * amount
         take = min(level_value, remaining)
         total_quote += take
