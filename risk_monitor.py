@@ -56,6 +56,7 @@ class Config:
     poll_interval_s: float = _f("POLL_INTERVAL_S", 20)
     panel_port: int = int(_f("PANEL_PORT", 8080))
     data_log_path: str = os.environ.get("DATA_LOG_PATH", "snapshots.csv")
+    tg_retries: int = int(_f("TG_RETRIES", 2))                  # extra attempts after the first
 
 
 @dataclass
@@ -143,10 +144,11 @@ async function tick(){
       cell("Benchmark (USD)", L.benchmark_usd!=null ? "$"+L.benchmark_usd.toLocaleString() : "—") +
       cell("Fetch window", L.fetch_window_s!=null ? L.fetch_window_s.toFixed(2)+"s" : "—") +
       cell("Last check", fmtAge(d.seconds_since_last_check)) +
-      cell("Uptime", fmtDur(d.uptime_s));
+      cell("Uptime", fmtDur(d.uptime_s)) +
+      cell("Alert channel", d.tg_fail_count > 0 ? "&#9888; "+d.tg_fail_count+" failed send"+(d.tg_fail_count>1?"s":"") : "OK");
     const a = d.last_alert;
     document.getElementById("alertbox").innerHTML = a
-      ? '<div class="alert"><b>Last alert:</b> '+a.reason+' &mdash; '+a.spread_pct+'% @ '+a.velocity_pct_min+'%/min ('+fmtAge((Date.now()/1000)-a.ts)+')</div>'
+      ? '<div class="alert"><b>Last alert:</b> '+a.reason+' &mdash; '+a.spread_pct+'% @ '+a.velocity_pct_min+'%/min ('+fmtAge((Date.now()/1000)-a.ts)+')'+(a.delivered===false?' &mdash; <b>NOT DELIVERED to Telegram</b>':'')+'</div>'
       : "";
     document.getElementById("foot").textContent = "auto-refreshing every 5s · updated just now";
   } catch(e){
@@ -174,6 +176,8 @@ class DislocationMonitor:
         self.started_at = time.time()
         self.latest: dict | None = None      # most recent computed snapshot
         self.last_alert_info: dict | None = None
+        self.tg_fail_count = 0               # sends that failed after all retries
+        self.tg_last_error: dict | None = None   # {"ts": float, "error": str}
 
         self.binance = ccxt.binance({"enableRateLimit": True})
         self.coinbase = ccxt.coinbase({"enableRateLimit": True})
@@ -302,10 +306,6 @@ class DislocationMonitor:
         if now - self.last_alert < self.cfg.confirm_seconds:
             return  # cooldown
         self.last_alert = now
-        self.last_alert_info = {
-            "ts": now, "reason": reason,
-            "spread_pct": round(spread, 2), "velocity_pct_min": round(velocity, 2),
-        }
 
         msg = (
             f"*{reason}*\n"
@@ -316,30 +316,58 @@ class DislocationMonitor:
             f"Suggested action: de-risk / halt strategy and review."
         )
         logging.critical(msg.replace("\n", " | "))
-        await self.send_telegram(msg)
+        delivered = await self.send_telegram(msg)
+        # Written only after the send so the panel reports what actually
+        # happened, including delivery status.
+        self.last_alert_info = {
+            "ts": now, "reason": reason,
+            "spread_pct": round(spread, 2), "velocity_pct_min": round(velocity, 2),
+            "delivered": delivered,
+        }
         # Integration hook: wire your own execution layer here if desired.
         # Intentionally not implemented in this repo (no trading keys committed).
 
     # -- telegram (async-safe) --------------------------------------------- #
-    async def send_telegram(self, message: str) -> None:
+    async def send_telegram(self, message: str) -> bool:
+        """Returns True only when Telegram confirmed delivery (HTTP 200).
+        Retries cfg.tg_retries times on failure; a send that fails every
+        attempt increments tg_fail_count and records tg_last_error so the
+        status panel / healthz can expose a broken alert channel."""
         if not TG_TOKEN or not TG_CHAT_ID:
             logging.info("[telegram disabled] %s", message.replace("\n", " | "))
-            return
+            return False
 
         def _post():
             url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+            # NOTE: legacy Markdown parse mode. Unescaped special chars in the
+            # message text (e.g. '_') make Telegram return 400.
             return requests.post(
                 url,
                 data={"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "Markdown"},
                 timeout=5,
             )
 
-        try:
-            resp = await asyncio.to_thread(_post)
-            if resp.status_code != 200:
-                logging.error("telegram send failed: %s", resp.text)
-        except Exception as e:
-            logging.error("telegram connection error: %s", e)
+        delays = (2, 5)  # seconds before 2nd and 3rd attempts
+        attempts = 1 + max(0, self.cfg.tg_retries)
+        last_error = ""
+        for attempt in range(attempts):
+            try:
+                resp = await asyncio.to_thread(_post)
+                if resp.status_code == 200:
+                    return True
+                last_error = f"HTTP {resp.status_code}: {resp.text}"
+                logging.error("telegram send failed (attempt %d/%d): %s",
+                              attempt + 1, attempts, last_error)
+            except Exception as e:
+                last_error = str(e)
+                logging.error("telegram connection error (attempt %d/%d): %s",
+                              attempt + 1, attempts, e)
+            if attempt < attempts - 1:
+                await asyncio.sleep(delays[min(attempt, len(delays) - 1)])
+
+        self.tg_fail_count += 1
+        self.tg_last_error = {"ts": time.time(), "error": last_error}
+        return False
 
     # -- status panel (public, read-only) ---------------------------------- #
     def _status(self) -> dict:
@@ -356,6 +384,8 @@ class DislocationMonitor:
             "seconds_since_last_check": round(now - last_ts, 1) if last_ts else None,
             "latest": self.latest,
             "last_alert": self.last_alert_info,
+            "tg_fail_count": self.tg_fail_count,
+            "tg_last_error": self.tg_last_error,
         }
 
     async def _handle_healthz(self, request: web.Request) -> web.Response:
@@ -392,7 +422,12 @@ class DislocationMonitor:
         await web.TCPSite(runner, "0.0.0.0", self.cfg.panel_port).start()
         logging.info("status panel on http://0.0.0.0:%s", self.cfg.panel_port)
 
-        await self.send_telegram("Monitor started | initializing market data...")
+        canary_ok = await self.send_telegram("Monitor started | initializing market data...")
+        if TG_TOKEN and TG_CHAT_ID and not canary_ok:
+            logging.critical(
+                "Telegram canary failed at startup; alerts may not be deliverable. "
+                "Check TG_TOKEN / TG_CHAT_ID. Panel 'Alert channel' cell shows failures."
+            )
         try:
             while True:
                 try:
